@@ -9,7 +9,7 @@ export default async function handler(request, response) {
     return response.status(400).json({ message: 'Parameter "symbol" diperlukan.' });
   }
 
-  const granularity = '1H'; // Interval 1 jam sesuai permintaan
+  const granularity = '1h'; // Interval 1 jam sesuai permintaan
   const limit = 200;      // Ambil 200 data candlestick terakhir
 
   try {
