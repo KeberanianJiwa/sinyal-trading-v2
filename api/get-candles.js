@@ -13,7 +13,7 @@ export default async function handler(request, response) {
   const limit = 200;      // Ambil 200 data candlestick terakhir
 
   try {
-    const bitgetApiUrl = `https://api.bitget.com/api/v2/spot/public/candles`;
+    const bitgetApiUrl = `https://api.bitget.com/api/v2/spot/market/candles`;
 
     console.log(`Workspaceing candles for: ${symbol.toUpperCase()}, Granularity: ${granularity}, Limit: ${limit}`);
 
