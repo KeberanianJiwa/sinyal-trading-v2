@@ -5,5 +5,11 @@
       "src": "api/**/*.js",
       "use": "@vercel/node"
     }
+  ],
+  "crons": [
+    {
+      "path": "/api/ping?secret=${CRON_JOB_SECRET}", 
+      "schedule": "0 7 * * *" 
+    }
   ]
 }
