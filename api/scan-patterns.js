@@ -40,9 +40,54 @@ if (!admin.apps.length) {
 }
 // --- Akhir Inisialisasi Firebase Admin SDK ---
 
-// Fungsi untuk mengirim notifikasi FCM ke sebuah topik
+// Dapatkan instance Firestore (BARU)
+let db;
+if (admin.apps.length && process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    db = admin.firestore();
+    console.log('[Firestore] Firestore instance obtained.');
+} else {
+    console.warn('[Firestore] Firestore not initialized because Firebase Admin SDK failed or service account is missing.');
+}
+
+// Fungsi untuk membuat ID unik untuk sebuah pola (BARU)
+function generatePatternId(pattern) {
+  const ts = pattern.breakoutConfirmation?.timestamp || 
+             pattern.S2?.timestamp || // Untuk IH&S, Double Bottom (jika ada S2)
+             pattern.E2?.timestamp || // Untuk Double Bottom
+             pattern.patternEndIndex || // Untuk Triangle/Wedge
+             pattern.H?.timestamp || // Cadangan untuk IH&S
+             Date.now(); // Fallback jika tidak ada timestamp yang jelas
+  return `${pattern.symbol}_${pattern.patternType}_${ts}`.replace(/\s+/g, '_');
+}
+
+// Fungsi untuk cek apakah sinyal sudah dinotifikasi & untuk mencatatnya (BARU)
+async function hasBeenNotifiedAndRecord(patternId) {
+  if (!db) {
+    console.warn('[Firestore] Firestore not available, cannot check notification status. Assuming not notified (will lead to duplicates if error persists).');
+    return false;
+  }
+  const notificationLogRef = db.collection('notified_signals').doc(patternId);
+  try {
+    const doc = await notificationLogRef.get();
+    if (doc.exists) {
+      console.log(`[Firestore] Pattern ID ${patternId} already notified on ${doc.data().notifiedAt?.toDate ? doc.data().notifiedAt.toDate().toISOString() : doc.data().notifiedAt}`);
+      return true;
+    } else {
+      await notificationLogRef.set({
+        notifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+        patternId: patternId
+      });
+      console.log(`[Firestore] Pattern ID ${patternId} recorded as notified.`);
+      return false;
+    }
+  } catch (error) {
+    console.error(`[Firestore] Error checking/recording notification status for ${patternId}:`, error);
+    return false; // Anggap belum dinotifikasi agar tidak kehilangan sinyal (risiko duplikat jika error berlanjut)
+  }
+}
+
+// Fungsi untuk mengirim notifikasi FCM
 async function sendFcmNotification(topic, title, body, patternData) {
-  // Cek apakah Firebase Admin SDK berhasil diinisialisasi
   if (!admin.apps.length || !process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
     console.warn('[FCM] Firebase Admin not initialized or FIREBASE_SERVICE_ACCOUNT_JSON missing. Skipping FCM notification.');
     return;
@@ -54,20 +99,20 @@ async function sendFcmNotification(topic, title, body, patternData) {
       body: body,
     },
     data: {
-      click_action: 'FLUTTER_NOTIFICATION_CLICK', // Atau sesuaikan dengan aksi di aplikasi Anda
+      click_action: 'FLUTTER_NOTIFICATION_CLICK',
       symbol: patternData.symbol || '',
       patternType: patternData.patternType || '',
       timestamp: patternData.breakoutConfirmation ? String(patternData.breakoutConfirmation.timestamp) : String(Date.now()),
-      // Anda bisa tambahkan data lain yang relevan
-      status: patternData.status || 'Pattern Detected', // Untuk informasi tambahan di notifikasi
-      targetPrice: patternData.projection?.targetPrice ? String(patternData.projection.targetPrice) : 'N/A',
+      status: patternData.status || 'Pattern Detected',
+      targetPrice: patternData.projection?.targetPrice ? String(patternData.projection.targetPrice.toFixed(2)) : 'N/A',
+      breakoutPrice: patternData.breakoutConfirmation?.closePrice ? String(patternData.breakoutConfirmation.closePrice.toFixed(2)) : 'N/A',
     },
     topic: topic
   };
 
   try {
     const response = await admin.messaging().send(message);
-    console.log(`[FCM] Successfully sent message to topic ${topic}:`, response);
+    console.log(`[FCM] Successfully sent message to topic ${topic}: MessageID=${response}`);
   } catch (error) {
     console.error(`[FCM] Error sending message to topic ${topic}:`, error.message, error.code);
     if (error.errorInfo) {
@@ -76,18 +121,15 @@ async function sendFcmNotification(topic, title, body, patternData) {
   }
 }
 
-
 export default async function handler(request, response) {
   const { symbol, secret } = request.query;
 
   // --- Otorisasi untuk Cron Job ---
   const vercelManagedCronSecret = request.headers['x-vercel-cron-secret'];
-  const userDefinedCronSecret = process.env.CRON_JOB_SECRET; // Nilai: cronRahasiaSuperAman123!
-
+  const userDefinedCronSecret = process.env.CRON_JOB_SECRET;
   let authorized = false;
 
   if (vercelManagedCronSecret && process.env.CRON_JOB_SECRET_VERCEL_PROTECTED) {
-    // Prioritaskan secret yang dikelola Vercel jika ada dan env varnya diset
     if (vercelManagedCronSecret === process.env.CRON_JOB_SECRET_VERCEL_PROTECTED) {
       authorized = true;
       console.log('[scan-patterns] Authorized via Vercel-managed cron secret header.');
@@ -95,7 +137,6 @@ export default async function handler(request, response) {
       console.warn('[scan-patterns] Invalid Vercel-managed cron secret header received.');
     }
   } else if (secret && userDefinedCronSecret) {
-    // Fallback ke query parameter 'secret' jika header Vercel tidak digunakan/tidak ada
     if (secret === userDefinedCronSecret) {
       authorized = true;
       console.log('[scan-patterns] Authorized via user-defined query parameter secret.');
@@ -103,18 +144,15 @@ export default async function handler(request, response) {
       console.warn('[scan-patterns] Invalid user-defined query parameter secret received.');
     }
   } else if (process.env.NODE_ENV !== 'production' && !request.headers['user-agent']?.includes('vercel-cron')) {
-    // Izinkan jika bukan di production DAN bukan dari User-Agent Vercel Cron (untuk tes lokal/browser)
     authorized = true;
     console.log('[scan-patterns] Call allowed in non-production environment or non-cron user-agent without secret (for testing).');
   }
-
 
   if (!authorized) {
     console.warn('[scan-patterns] Unauthorized attempt to access scan-patterns.');
     return response.status(401).json({ message: 'Unauthorized.' });
   }
   // --- Akhir Otorisasi Cron Job ---
-
 
   if (!symbol) {
     return response.status(400).json({ message: 'Parameter "symbol" diperlukan.' });
@@ -129,7 +167,7 @@ export default async function handler(request, response) {
   const detectionPromises = patternDetectors.map(detectorName => {
     const apiUrl = `${protocol}://${host}/api/${detectorName}`;
     console.log(`[scan-patterns] Calling: ${apiUrl}?symbol=${upperSymbol}`);
-    const timeoutMs = 45000; // Timeout per endpoint detektor
+    const timeoutMs = 45000;
     return axios.get(apiUrl, {
       params: { symbol: upperSymbol },
       headers: { 'Accept': 'application/json' },
@@ -156,7 +194,7 @@ export default async function handler(request, response) {
 
   let allDetectedPatterns = [];
   let errorsEncountered = [];
-  let parametersUsedByDetectors = {}; // Mengumpulkan parameter dari semua detektor
+  let parametersUsedByDetectors = {};
 
   results.forEach(result => {
     if (result.status === 'fulfilled') {
@@ -167,12 +205,12 @@ export default async function handler(request, response) {
             console.log(`[scan-patterns] Result from ${detectorName}: ${responseData.message}`);
             if (responseData.patterns && Array.isArray(responseData.patterns) && responseData.patterns.length > 0) {
                 const patternsWithType = responseData.patterns.map(p => ({
-                ...p,
-                patternType: patternTypeMapping[detectorName] || detectorName
+                  ...p,
+                  patternType: patternTypeMapping[detectorName] || detectorName
                 }));
                 allDetectedPatterns = allDetectedPatterns.concat(patternsWithType);
             }
-            if (responseData.parameters_used) { // Ambil parameter dari setiap hasil
+            if (responseData.parameters_used) {
                 parametersUsedByDetectors[detectorName] = responseData.parameters_used;
             }
         } else {
@@ -185,25 +223,35 @@ export default async function handler(request, response) {
     }
   });
 
-  // --- Kirim Notifikasi untuk Pola Baru yang Ditemukan ---
-  if (allDetectedPatterns.length > 0) {
-    console.log(`[scan-patterns] Attempting to send notifications for ${allDetectedPatterns.length} patterns...`);
+  // --- Kirim Notifikasi untuk Pola BARU yang Ditemukan ---
+  if (allDetectedPatterns.length > 0 && db) {
+    console.log(`[scan-patterns] Attempting to process ${allDetectedPatterns.length} detected patterns for notification...`);
     for (const pattern of allDetectedPatterns) {
-      // TODO: Implementasi logika untuk cek apakah pola ini BARU dan belum pernah dinotifikasi
-      // (misalnya menggunakan Firestore untuk menyimpan ID pola yang sudah dinotifikasi)
-      // Untuk sekarang, akan selalu coba kirim notifikasi untuk setiap pola terkonfirmasi.
+      const patternId = generatePatternId(pattern);
+      console.log(`[scan-patterns] Processing pattern with ID: ${patternId}`);
 
-      const topic = `signals_${pattern.symbol.toUpperCase()}`; // e.g., signals_BTCUSDT
-      // Anda juga bisa punya topik umum seperti "all_new_signals"
-      // const generalTopic = "all_new_signals";
+      const alreadyNotified = await hasBeenNotifiedAndRecord(patternId);
 
-      const title = `Sinyal Pola Baru: ${pattern.patternType}`;
-      const body = `${pattern.symbol}: ${pattern.status || 'Pola terdeteksi'}. Breakout di ${pattern.breakoutConfirmation?.closePrice?.toFixed(2) || 'N/A'}. Target ${pattern.projection?.targetPrice ? pattern.projection.targetPrice.toFixed(2) : 'N/A'}.`;
-
-      console.log(`[scan-patterns] Preparing to send FCM for: ${title} - ${body} to topic ${topic}`);
-      await sendFcmNotification(topic, title, body, pattern);
-      // await sendFcmNotification(generalTopic, title, body, pattern); // Jika ingin kirim ke topik umum juga
+      if (!alreadyNotified) {
+        const topic = `signals_${pattern.symbol.toUpperCase()}`;
+        const title = `Sinyal Pola Baru: ${pattern.patternType}`;
+        const body = `${pattern.symbol}: ${pattern.status || 'Pola terdeteksi'}. Breakout @ ${pattern.breakoutConfirmation?.closePrice?.toFixed(2) || 'N/A'}. Target ${pattern.projection?.targetPrice ? pattern.projection.targetPrice.toFixed(2) : 'N/A'}.`;
+        
+        console.log(`[scan-patterns] Preparing to send NEW FCM for: ${title} - ${body} to topic ${topic}`);
+        await sendFcmNotification(topic, title, body, pattern);
+      } else {
+        console.log(`[scan-patterns] Pattern ID ${patternId} was already notified. Skipping FCM.`);
+      }
     }
+  } else if (allDetectedPatterns.length > 0 && !db) {
+    console.warn('[scan-patterns] Patterns detected, but Firestore is not available. Notifications might be duplicated.');
+    // Fallback: send notifications anyway if db is not available, but with risk of duplicates
+    // for (const pattern of allDetectedPatterns) {
+    //   const topic = `signals_${pattern.symbol.toUpperCase()}`;
+    //   const title = `Sinyal Pola Baru: ${pattern.patternType}`;
+    //   const body = `${pattern.symbol}: ${pattern.status || 'Pola terdeteksi'}. Breakout @ ...`;
+    //   await sendFcmNotification(topic, title, body, pattern);
+    // }
   }
   // --- Akhir Kirim Notifikasi ---
 
