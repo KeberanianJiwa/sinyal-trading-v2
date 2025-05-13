@@ -1,5 +1,6 @@
 // File: api/scan-patterns.js
 import axios from 'axios';
+import admin from 'firebase-admin'; // Impor firebase-admin
 
 // Daftar fungsi deteksi pola yang akan dipanggil
 const patternDetectors = [
@@ -19,34 +20,92 @@ const patternTypeMapping = {
   'detect-ascending-triangle': 'Ascending Triangle',
 };
 
+// --- Inisialisasi Firebase Admin SDK ---
+// Pastikan hanya diinisialisasi sekali
+if (!admin.apps.length) {
+  try {
+    const serviceAccountString = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+    if (!serviceAccountString) {
+      console.error('[Firebase Admin] FIREBASE_SERVICE_ACCOUNT_JSON environment variable not set. Notifications will be skipped.');
+    } else {
+      const serviceAccount = JSON.parse(serviceAccountString);
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount)
+      });
+      console.log('[Firebase Admin] Firebase Admin SDK Initialized successfully.');
+    }
+  } catch (e) {
+    console.error('[Firebase Admin] Error initializing Firebase Admin SDK:', e.message);
+  }
+}
+// --- Akhir Inisialisasi Firebase Admin SDK ---
+
+// Fungsi untuk mengirim notifikasi FCM ke sebuah topik
+async function sendFcmNotification(topic, title, body, patternData) {
+  // Cek apakah Firebase Admin SDK berhasil diinisialisasi
+  if (!admin.apps.length || !process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    console.warn('[FCM] Firebase Admin not initialized or FIREBASE_SERVICE_ACCOUNT_JSON missing. Skipping FCM notification.');
+    return;
+  }
+
+  const message = {
+    notification: {
+      title: title,
+      body: body,
+    },
+    data: {
+      click_action: 'FLUTTER_NOTIFICATION_CLICK', // Atau sesuaikan dengan aksi di aplikasi Anda
+      symbol: patternData.symbol || '',
+      patternType: patternData.patternType || '',
+      timestamp: patternData.breakoutConfirmation ? String(patternData.breakoutConfirmation.timestamp) : String(Date.now()),
+      // Anda bisa tambahkan data lain yang relevan
+      status: patternData.status || 'Pattern Detected', // Untuk informasi tambahan di notifikasi
+      targetPrice: patternData.projection?.targetPrice ? String(patternData.projection.targetPrice) : 'N/A',
+    },
+    topic: topic
+  };
+
+  try {
+    const response = await admin.messaging().send(message);
+    console.log(`[FCM] Successfully sent message to topic ${topic}:`, response);
+  } catch (error) {
+    console.error(`[FCM] Error sending message to topic ${topic}:`, error.message, error.code);
+    if (error.errorInfo) {
+        console.error('[FCM] Firebase Error Info:', JSON.stringify(error.errorInfo));
+    }
+  }
+}
+
+
 export default async function handler(request, response) {
-  const { symbol, secret } = request.query; // Ambil 'secret' dari query parameter
+  const { symbol, secret } = request.query;
 
   // --- Otorisasi untuk Cron Job ---
-  const vercelCronSecret = request.headers['x-vercel-cron-secret'];
-  const userDefinedSecret = process.env.CRON_JOB_SECRET; // Ini yang Anda set: cronRahasiaSuperAman123!
+  const vercelManagedCronSecret = request.headers['x-vercel-cron-secret'];
+  const userDefinedCronSecret = process.env.CRON_JOB_SECRET; // Nilai: cronRahasiaSuperAman123!
 
   let authorized = false;
 
-  if (vercelCronSecret) { // Jika Vercel mengirim header secretnya sendiri (fitur Cron Job Protection)
-    if (vercelCronSecret === process.env.CRON_JOB_SECRET_VERCEL_PROTECTED) { // Nama env var ini diisi Vercel
+  if (vercelManagedCronSecret && process.env.CRON_JOB_SECRET_VERCEL_PROTECTED) {
+    // Prioritaskan secret yang dikelola Vercel jika ada dan env varnya diset
+    if (vercelManagedCronSecret === process.env.CRON_JOB_SECRET_VERCEL_PROTECTED) {
       authorized = true;
       console.log('[scan-patterns] Authorized via Vercel-managed cron secret header.');
     } else {
       console.warn('[scan-patterns] Invalid Vercel-managed cron secret header received.');
     }
-  } else if (secret && userDefinedSecret) { // Jika header Vercel tidak ada, cek query parameter 'secret'
-    if (secret === userDefinedSecret) {
+  } else if (secret && userDefinedCronSecret) {
+    // Fallback ke query parameter 'secret' jika header Vercel tidak digunakan/tidak ada
+    if (secret === userDefinedCronSecret) {
       authorized = true;
       console.log('[scan-patterns] Authorized via user-defined query parameter secret.');
     } else {
       console.warn('[scan-patterns] Invalid user-defined query parameter secret received.');
     }
   } else if (process.env.NODE_ENV !== 'production' && !request.headers['user-agent']?.includes('vercel-cron')) {
-    // Izinkan jika bukan di production DAN bukan dari User-Agent Vercel Cron (misalnya, tes lokal atau dari browser di dev)
-    // Anda mungkin ingin menghapus atau memperketat ini untuk production jika tidak ada secret sama sekali
+    // Izinkan jika bukan di production DAN bukan dari User-Agent Vercel Cron (untuk tes lokal/browser)
     authorized = true;
-    console.log('[scan-patterns] Call allowed in non-production environment or non-cron user-agent without secret.');
+    console.log('[scan-patterns] Call allowed in non-production environment or non-cron user-agent without secret (for testing).');
   }
 
 
@@ -70,7 +129,7 @@ export default async function handler(request, response) {
   const detectionPromises = patternDetectors.map(detectorName => {
     const apiUrl = `${protocol}://${host}/api/${detectorName}`;
     console.log(`[scan-patterns] Calling: ${apiUrl}?symbol=${upperSymbol}`);
-    const timeoutMs = 45000; // Naikkan timeout menjadi 45 detik per endpoint karena ada 5 panggilan
+    const timeoutMs = 45000; // Timeout per endpoint detektor
     return axios.get(apiUrl, {
       params: { symbol: upperSymbol },
       headers: { 'Accept': 'application/json' },
@@ -96,14 +155,13 @@ export default async function handler(request, response) {
   console.log('[scan-patterns] All detection calls completed.');
 
   let allDetectedPatterns = [];
-  let errorsEncountered = []; // Diubah nama variabelnya agar lebih jelas
-  let parametersUsedFromDetectors = {};
+  let errorsEncountered = [];
+  let parametersUsedByDetectors = {}; // Mengumpulkan parameter dari semua detektor
 
   results.forEach(result => {
-    if (result.status === 'fulfilled') { // Promise utama axios.get().then() atau .catch() terpenuhi
-        const outcome = result.value; // Ini adalah objek yang kita return dari .then() atau .catch()
-
-        if (outcome.status === 'fulfilled') { // Pemanggilan API spesifik berhasil
+    if (result.status === 'fulfilled') {
+        const outcome = result.value;
+        if (outcome.status === 'fulfilled') {
             const detectorName = outcome.detector;
             const responseData = outcome.data;
             console.log(`[scan-patterns] Result from ${detectorName}: ${responseData.message}`);
@@ -114,20 +172,40 @@ export default async function handler(request, response) {
                 }));
                 allDetectedPatterns = allDetectedPatterns.concat(patternsWithType);
             }
-            // Ambil parameters_used dari hasil pertama yang sukses dan punya parameters_used
-            if (Object.keys(parametersUsedFromDetectors).length === 0 && responseData.parameters_used) {
-                parametersUsedFromDetectors[detectorName] = responseData.parameters_used;
+            if (responseData.parameters_used) { // Ambil parameter dari setiap hasil
+                parametersUsedByDetectors[detectorName] = responseData.parameters_used;
             }
-        } else { // Pemanggilan API spesifik gagal (masuk ke .catch() di atas)
+        } else {
             console.error(`[scan-patterns] Detector ${outcome.detector} call failed:`, outcome.reason);
             errorsEncountered.push({ detector: outcome.detector, reason: outcome.reason });
         }
-    } else { // Promise utama untuk axios.get() itu sendiri gagal (jarang terjadi dengan .catch() yang sudah ada)
+    } else {
       console.error(`[scan-patterns] Promise for a detector itself failed:`, result.reason);
-      // Sulit mendapatkan detectorName di sini jika promise-nya sendiri gagal sebelum axios dipanggil
       errorsEncountered.push({ detector: 'unknown_promise_failure', reason: result.reason?.message || 'Unknown promise rejection' });
     }
   });
+
+  // --- Kirim Notifikasi untuk Pola Baru yang Ditemukan ---
+  if (allDetectedPatterns.length > 0) {
+    console.log(`[scan-patterns] Attempting to send notifications for ${allDetectedPatterns.length} patterns...`);
+    for (const pattern of allDetectedPatterns) {
+      // TODO: Implementasi logika untuk cek apakah pola ini BARU dan belum pernah dinotifikasi
+      // (misalnya menggunakan Firestore untuk menyimpan ID pola yang sudah dinotifikasi)
+      // Untuk sekarang, akan selalu coba kirim notifikasi untuk setiap pola terkonfirmasi.
+
+      const topic = `signals_${pattern.symbol.toUpperCase()}`; // e.g., signals_BTCUSDT
+      // Anda juga bisa punya topik umum seperti "all_new_signals"
+      // const generalTopic = "all_new_signals";
+
+      const title = `Sinyal Pola Baru: ${pattern.patternType}`;
+      const body = `${pattern.symbol}: ${pattern.status || 'Pola terdeteksi'}. Breakout di ${pattern.breakoutConfirmation?.closePrice?.toFixed(2) || 'N/A'}. Target ${pattern.projection?.targetPrice ? pattern.projection.targetPrice.toFixed(2) : 'N/A'}.`;
+
+      console.log(`[scan-patterns] Preparing to send FCM for: ${title} - ${body} to topic ${topic}`);
+      await sendFcmNotification(topic, title, body, pattern);
+      // await sendFcmNotification(generalTopic, title, body, pattern); // Jika ingin kirim ke topik umum juga
+    }
+  }
+  // --- Akhir Kirim Notifikasi ---
 
   console.log(`[scan-patterns] Total confirmed patterns found across all types: ${allDetectedPatterns.length}`);
 
@@ -135,7 +213,7 @@ export default async function handler(request, response) {
     symbol: upperSymbol,
     scanTime: new Date().toISOString(),
     detectedPatterns: allDetectedPatterns,
-    parametersUsedByDetectors: parametersUsedFromDetectors, // Menampilkan parameter dari detektor
+    parametersUsedByDetectors: parametersUsedByDetectors,
     errors: errorsEncountered
   });
 }
