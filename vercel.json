@@ -1,0 +1,20 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "api/**/*.js",
+      "use": "@vercel/node"
+    }
+  ],
+  "crons": [
+    {
+      "path": "/api/scan-patterns?symbol=BTCUSDT&secret=${CRON_JOB_SECRET}",
+      "schedule": "0 * * * *"
+    },
+    {
+      "path": "/api/scan-patterns?symbol=ETHUSDT&secret=${CRON_JOB_SECRET}",
+      "schedule": "5 * * * *"
+    }
+  
+  ]
+}
