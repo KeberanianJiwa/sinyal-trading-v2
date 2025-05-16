@@ -47,6 +47,8 @@ if (admin.apps.length && process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
     console.warn('[Firestore] Firestore not initialized because Firebase Admin SDK failed or service account is missing.');
 }
 
+// Helper function untuk mendapatkan timestamp dari candle berdasarkan index
+// (Kita asumsikan 'candles' array akan tersedia saat fungsi ini dipanggil jika diperlukan)
 function getCandleTimestamp(candles, index) {
     if (candles && index >= 0 && index < candles.length && candles[index] && candles[index].timestamp) {
         return candles[index].timestamp;
@@ -54,24 +56,32 @@ function getCandleTimestamp(candles, index) {
     return null;
 }
 
-function generatePatternId(pattern, candles) { // Tambahkan 'candles' jika diperlukan untuk patternEndIndex
+// Fungsi untuk membuat ID unik untuk sebuah pola
+function generatePatternId(pattern, candles) {
+  // Prioritaskan timestamp breakout jika ada
   const breakoutTs = pattern.breakoutConfirmation?.timestamp;
-  const s2Ts = pattern.S2?.timestamp;
-  const e2Ts = pattern.E2?.timestamp;
-  const hTs = pattern.H?.timestamp;
-  
+  // Timestamp lain sebagai fallback, tergantung jenis pola
+  const s2Ts = pattern.S2?.timestamp; // Untuk IH&S, Double Bottom
+  const e2Ts = pattern.E2?.timestamp; // Untuk Double Bottom
+  const hTs = pattern.H?.timestamp;   // Untuk IH&S (kepala)
+
+  // Untuk pola Triangle/Wedge, patternEndIndex bisa jadi relevan,
+  // tapi kita butuh array 'candles' untuk mendapatkan timestamp sebenarnya.
+  // Jika tidak ada 'candles' di sini, kita tidak bisa menggunakan patternEndIndex untuk timestamp yang akurat.
   let patternSpecificTimestamp = null;
   if (pattern.patternEndIndex !== undefined && pattern.patternEndIndex !== null && candles) {
       patternSpecificTimestamp = getCandleTimestamp(candles, pattern.patternEndIndex);
   }
-
-  const ts = breakoutTs || s2Ts || e2Ts || patternSpecificTimestamp || hTs || Date.now();
+  
+  const ts = breakoutTs || s2Ts || e2Ts || patternSpecificTimestamp || hTs || Date.now(); // Fallback ke waktu sekarang jika tidak ada ts lain
+  // Ganti spasi dan '&' agar aman sebagai ID dokumen Firestore
   return `${pattern.symbol}_${pattern.patternType}_${ts}`.replace(/\s+/g, '_').replace(/&/g, 'And');
 }
 
+// Fungsi untuk cek apakah sinyal sudah dinotifikasi & untuk mencatatnya dengan detail
 async function hasBeenNotifiedAndRecord(patternId, fullPatternData, candles) { // Tambahkan 'candles'
   if (!db) {
-    console.warn('[Firestore] Firestore not available, cannot check/record. Assuming not notified.');
+    console.warn('[Firestore] Firestore not available, cannot check/record. Assuming not notified (will lead to duplicates if error persists).');
     return false;
   }
   const notificationLogRef = db.collection('notified_signals').doc(patternId);
@@ -81,6 +91,7 @@ async function hasBeenNotifiedAndRecord(patternId, fullPatternData, candles) { /
       console.log(`[Firestore] Pattern ID ${patternId} already notified on ${doc.data().notifiedAt?.toDate ? doc.data().notifiedAt.toDate().toISOString() : doc.data().notifiedAt}`);
       return true;
     } else {
+      // Tentukan effectiveTimestamp untuk disimpan dan diurutkan
       const breakoutTs = fullPatternData.breakoutConfirmation?.timestamp;
       const s2Ts = fullPatternData.S2?.timestamp;
       const e2Ts = fullPatternData.E2?.timestamp;
@@ -89,20 +100,25 @@ async function hasBeenNotifiedAndRecord(patternId, fullPatternData, candles) { /
       if (fullPatternData.patternEndIndex !== undefined && fullPatternData.patternEndIndex !== null && candles) {
           patternSpecificTimestamp = getCandleTimestamp(candles, fullPatternData.patternEndIndex);
       }
+      const effectiveTs = breakoutTs || s2Ts || e2Ts || patternSpecificTimestamp || hTs || Date.now();
 
       const dataToStore = {
-        notifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+        notifiedAt: admin.firestore.FieldValue.serverTimestamp(), // Timestamp Firebase saat ini
         patternId: patternId,
         symbol: fullPatternData.symbol,
         patternType: fullPatternData.patternType,
         status: fullPatternData.status,
-        // Menggunakan salah satu timestamp yang paling relevan sebagai 'effectiveTimestamp'
-        effectiveTimestamp: breakoutTs || s2Ts || e2Ts || patternSpecificTimestamp || hTs || Date.now(),
+        effectiveTimestamp: effectiveTs, // Timestamp utama pola untuk sorting riwayat
         breakoutPrice: fullPatternData.breakoutConfirmation?.closePrice ? parseFloat(fullPatternData.breakoutConfirmation.closePrice.toFixed(2)) : null,
         targetPrice: fullPatternData.projection?.targetPrice ? parseFloat(fullPatternData.projection.targetPrice.toFixed(2)) : null,
         volumeConfirmed: fullPatternData.breakoutConfirmation?.volumeConfirmed || false,
-        // Anda bisa menambahkan detail titik-titik pola jika diperlukan untuk riwayat
-        // S1_low: fullPatternData.S1?.low, H_low: fullPatternData.H?.low, S2_low: fullPatternData.S2?.low, etc.
+        // Anda bisa tambahkan detail titik-titik pola di sini jika ingin ditampilkan di riwayat
+        // Contoh:
+        // S1_timestamp: fullPatternData.S1?.timestamp || null,
+        // H_timestamp: fullPatternData.H?.timestamp || null,
+        // S2_timestamp: fullPatternData.S2?.timestamp || null,
+        // P1_timestamp: fullPatternData.P1?.timestamp || null,
+        // P2_timestamp: fullPatternData.P2?.timestamp || null,
       };
       await notificationLogRef.set(dataToStore);
       console.log(`[Firestore] Pattern ID ${patternId} recorded as notified with details:`, dataToStore);
@@ -110,26 +126,29 @@ async function hasBeenNotifiedAndRecord(patternId, fullPatternData, candles) { /
     }
   } catch (error) {
     console.error(`[Firestore] Error checking/recording notification status for ${patternId}:`, error);
-    return false;
+    return false; 
   }
 }
 
+// Fungsi untuk mengirim notifikasi FCM
 async function sendFcmNotification(topic, title, body, patternData) {
   if (!admin.apps.length || !process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
     console.warn('[FCM] Firebase Admin not initialized or FIREBASE_SERVICE_ACCOUNT_JSON missing. Skipping FCM notification.');
     return;
   }
 
+  // Ambil effectiveTimestamp yang sama dengan yang disimpan di Firestore untuk konsistensi
   const breakoutTs = patternData.breakoutConfirmation?.timestamp;
   const s2Ts = patternData.S2?.timestamp;
   const e2Ts = patternData.E2?.timestamp;
   const hTs = patternData.H?.timestamp;
   let patternSpecificTimestamp = null;
-   // Asumsi 'candles' bisa diakses atau sudah jadi bagian dari patternData jika patternEndIndex digunakan untuk timestamp
-   // Jika 'candles' tidak tersedia di sini, logika timestamp untuk patternEndIndex perlu penyesuaian
-  if (patternData.patternEndIndex !== undefined && patternData.patternEndIndex !== null /* && patternData.candles */) {
-      // patternSpecificTimestamp = getCandleTimestamp(patternData.candles, patternData.patternEndIndex); // Jika candles ada di patternData
-  }
+  // Untuk mengirim 'candles' ke sini, patternData harus sudah mengandungnya, atau kita ambil dari sumber lain
+  // Jika tidak, timestamp berdasarkan patternEndIndex tidak bisa akurat.
+  // if (patternData.patternEndIndex !== undefined && patternData.patternEndIndex !== null && patternData.candles) {
+  //     patternSpecificTimestamp = getCandleTimestamp(patternData.candles, patternData.patternEndIndex);
+  // }
+  const effectiveTsForFcm = String(breakoutTs || s2Ts || e2Ts || patternSpecificTimestamp || hTs || Date.now());
 
   const message = {
     notification: {
@@ -137,10 +156,10 @@ async function sendFcmNotification(topic, title, body, patternData) {
       body: body,
     },
     data: {
-      click_action: 'FLUTTER_NOTIFICATION_CLICK',
+      click_action: 'FLUTTER_NOTIFICATION_CLICK', // Atau nama aksi standar Android Anda
       symbol: String(patternData.symbol || ''),
       patternType: String(patternData.patternType || ''),
-      timestamp: String(breakoutTs || s2Ts || e2Ts || patternSpecificTimestamp || hTs || Date.now()),
+      timestamp: effectiveTsForFcm, // Gunakan timestamp yang konsisten
       status: String(patternData.status || 'Pattern Detected'),
       targetPrice: patternData.projection?.targetPrice ? String(patternData.projection.targetPrice.toFixed(2)) : 'N/A',
       breakoutPrice: patternData.breakoutConfirmation?.closePrice ? String(patternData.breakoutConfirmation.closePrice.toFixed(2)) : 'N/A',
@@ -168,10 +187,10 @@ export default async function handler(request, response) {
   const userDefinedCronSecret = process.env.CRON_JOB_SECRET;
   let authorized = false;
   if (vercelManagedCronSecret && process.env.CRON_JOB_SECRET_VERCEL_PROTECTED) {
-    if (vercelManagedCronSecret === process.env.CRON_JOB_SECRET_VERCEL_PROTECTED) { authorized = true; console.log('[scan-patterns] Authorized via Vercel-managed cron secret header.'); }
+    if (vercelManagedCronSecret === process.env.CRON_JOB_SECRET_VERCEL_PROTECTED) { authorized = true; console.log('[scan-patterns] Authorized via Vercel-managed cron secret header.'); } 
     else { console.warn('[scan-patterns] Invalid Vercel-managed cron secret header received.'); }
   } else if (secret && userDefinedCronSecret) {
-    if (secret === userDefinedCronSecret) { authorized = true; console.log('[scan-patterns] Authorized via user-defined query parameter secret.'); }
+    if (secret === userDefinedCronSecret) { authorized = true; console.log('[scan-patterns] Authorized via user-defined query parameter secret.'); } 
     else { console.warn('[scan-patterns] Invalid user-defined query parameter secret received.'); }
   } else if (process.env.NODE_ENV !== 'production' && !request.headers['user-agent']?.includes('vercel-cron')) {
     authorized = true; console.log('[scan-patterns] Call allowed in non-production environment or non-cron user-agent without secret (for testing).');
@@ -188,9 +207,13 @@ export default async function handler(request, response) {
 
   const protocol = request.headers['x-forwarded-proto'] || 'http';
   const host = request.headers.host;
-  let allCandlesData = null; // Untuk menyimpan data candle yang akan di-pass ke generatePatternId dan hasBeenNotifiedAndRecord
+  
+  // Variabel untuk menyimpan data candle yang mungkin akan digunakan oleh beberapa fungsi
+  // Ini perlu diisi dari respons /api/get-candles jika ingin digunakan di generatePatternId/hasBeenNotifiedAndRecord
+  // Untuk sekarang, kita belum mengambilnya secara terpusat di sini.
+  let candlesForSymbol = null; 
 
-  const detectionPromises = patternDetectors.map(async (detectorName) => { // Ubah jadi async
+  const detectionPromises = patternDetectors.map(async (detectorName) => {
     const apiUrl = `${protocol}://${host}/api/${detectorName}`;
     console.log(`[scan-patterns] Calling: ${apiUrl}?symbol=${upperSymbol}`);
     const timeoutMs = 45000;
@@ -200,13 +223,11 @@ export default async function handler(request, response) {
         headers: { 'Accept': 'application/json' },
         timeout: timeoutMs
       });
-      // Simpan data candle jika ini adalah pemanggilan pertama yang berhasil mengambilnya
-      // Asumsi semua detektor menggunakan data candle yang sama dari /api/get-candles
-      // Jika masing-masing detektor mengembalikan 'candles' dalam responsnya, itu lebih baik.
-      // Untuk sekarang, kita asumsikan respons detektor tidak mengandung 'candles' array.
-      // Ini berarti generatePatternId dan hasBeenNotifiedAndRecord mungkin perlu penyesuaian jika mengandalkan 'candles' dari respons detektor.
-      // Alternatifnya, /api/scan-patterns bisa panggil /api/get-candles sekali, lalu pass ke semua detektor.
-      // Kita akan biarkan logika generatePatternId dan hasBeenNotifiedAndRecord tanpa 'candles' untuk saat ini.
+      // Jika fungsi detektor mengembalikan array 'candles' (misalnya, dari respons /api/get-candles internalnya),
+      // kita bisa coba ambil di sini. Tapi ini bergantung pada desain respons detektor.
+      // if (res.data && res.data.candles && !candlesForSymbol) {
+      //     candlesForSymbol = res.data.candles;
+      // }
       return {
           status: 'fulfilled',
           detector: detectorName,
@@ -231,26 +252,24 @@ export default async function handler(request, response) {
   let parametersUsedByDetectors = {};
 
   results.forEach(result => {
-    if (result.status === 'fulfilled') {
+    if (result.status === 'fulfilled' && result.value.status === 'fulfilled') {
         const outcome = result.value;
-        if (outcome.status === 'fulfilled') {
-            const detectorName = outcome.detector;
-            const responseData = outcome.data;
-            console.log(`[scan-patterns] Result from ${detectorName}: ${responseData.message}`);
-            if (responseData.patterns && Array.isArray(responseData.patterns) && responseData.patterns.length > 0) {
-                const patternsWithType = responseData.patterns.map(p => ({
-                ...p,
-                patternType: patternTypeMapping[detectorName] || detectorName
-                }));
-                allDetectedPatterns = allDetectedPatterns.concat(patternsWithType);
-            }
-            if (responseData.parameters_used) {
-                parametersUsedByDetectors[detectorName] = responseData.parameters_used;
-            }
-        } else {
-            console.error(`[scan-patterns] Detector ${outcome.detector} call failed:`, outcome.reason);
-            errorsEncountered.push({ detector: outcome.detector, reason: outcome.reason });
+        const detectorName = outcome.detector;
+        const responseData = outcome.data;
+        console.log(`[scan-patterns] Result from ${detectorName}: ${responseData.message}`);
+        if (responseData.patterns && Array.isArray(responseData.patterns) && responseData.patterns.length > 0) {
+            const patternsWithType = responseData.patterns.map(p => ({
+            ...p,
+            patternType: patternTypeMapping[detectorName] || detectorName
+            }));
+            allDetectedPatterns = allDetectedPatterns.concat(patternsWithType);
         }
+        if (responseData.parameters_used) {
+            parametersUsedByDetectors[detectorName] = responseData.parameters_used;
+        }
+    } else if (result.status === 'fulfilled' && result.value.status === 'rejected') {
+        console.error(`[scan-patterns] Detector ${result.value.detector} call failed:`, result.value.reason);
+        errorsEncountered.push({ detector: result.value.detector, reason: result.value.reason });
     } else {
       console.error(`[scan-patterns] Promise for a detector itself failed:`, result.reason);
       errorsEncountered.push({ detector: 'unknown_promise_failure', reason: result.reason?.message || 'Unknown promise rejection' });
@@ -261,21 +280,52 @@ export default async function handler(request, response) {
   if (allDetectedPatterns.length > 0 && db) {
     console.log(`[scan-patterns] Attempting to process ${allDetectedPatterns.length} detected patterns for notification...`);
     for (const pattern of allDetectedPatterns) {
-      // 'candles' tidak tersedia secara langsung di sini, jadi generatePatternId dan hasBeenNotifiedAndRecord akan menggunakan Date.now() jika patternEndIndex timestamp tidak ada
-      const patternId = generatePatternId(pattern, null); // Pass null untuk candles untuk saat ini
+      // Untuk 'candlesForSymbol', idealnya ini didapat dari respons detektor atau diambil sekali di awal.
+      // Jika tidak ada, generatePatternId dan hasBeenNotifiedAndRecord akan fallback.
+      const patternId = generatePatternId(pattern, candlesForSymbol); 
       console.log(`[scan-patterns] Processing pattern with ID: ${patternId}`);
 
-      const alreadyNotified = await hasBeenNotifiedAndRecord(patternId, pattern, null); // Pass null untuk candles
+      const alreadyNotified = await hasBeenNotifiedAndRecord(patternId, pattern, candlesForSymbol);
 
       if (!alreadyNotified) {
-        const topic = `signals_${pattern.symbol.toUpperCase()}`;
-        const title = `Sinyal Pola Baru: ${pattern.patternType}`;
-        const bodyText = `${pattern.symbol}: ${pattern.status || 'Pola terdeteksi'}. Breakout @ ${pattern.breakoutConfirmation?.closePrice?.toFixed(2) || 'N/A'}. Target ${pattern.projection?.targetPrice ? pattern.projection.targetPrice.toFixed(2) : 'N/A'}.`;
-        
-        console.log(`[scan-patterns] Preparing to send NEW FCM for: ${title} - ${bodyText} to topic ${topic}`);
-        await sendFcmNotification(topic, title, bodyText, pattern);
+        // Implementasi filter kesegaran di sini
+        let isFreshEnoughForNotification = false;
+        const effectiveTimestamp = pattern.breakoutConfirmation?.timestamp || 
+                                   pattern.S2?.timestamp || 
+                                   pattern.E2?.timestamp || 
+                                   (candlesForSymbol && pattern.patternEndIndex !== undefined ? getCandleTimestamp(candlesForSymbol, pattern.patternEndIndex) : null) || 
+                                   pattern.H?.timestamp;
+
+        if (effectiveTimestamp) {
+            const currentTime = Date.now();
+            const ageInMilliseconds = currentTime - effectiveTimestamp;
+            // Hanya kirim notifikasi jika pola terbentuk/breakout dalam 1 jam terakhir (3600000 ms)
+            const MAX_AGE_MILLISECONDS_FOR_NOTIFICATION = 1 * 60 * 60 * 1000; 
+
+            if (ageInMilliseconds <= MAX_AGE_MILLISECONDS_FOR_NOTIFICATION) {
+                isFreshEnoughForNotification = true;
+            } else {
+                console.log(`[scan-patterns] Pattern ID ${patternId} is too old for FCM notification (age: ${(ageInMilliseconds / (1000 * 60)).toFixed(1)} mins). Breakout: ${new Date(effectiveTimestamp).toISOString()}`);
+            }
+        } else {
+            // Jika tidak ada timestamp yang jelas, mungkin kita tetap kirim jika ini pertama kali terdeteksi
+            // Atau Anda bisa memilih untuk tidak mengirim sama sekali.
+            console.log(`[scan-patterns] No clear effectiveTimestamp for pattern ID ${patternId}. Defaulting to fresh if new.`);
+            isFreshEnoughForNotification = true; // Atau false jika Anda ingin lebih ketat
+        }
+
+        if (isFreshEnoughForNotification) {
+            const topic = `signals_${pattern.symbol.toUpperCase()}`;
+            const title = `Sinyal ${pattern.patternType} BARU!`; // Judul lebih menarik
+            const bodyText = `${pattern.symbol}: ${pattern.status || 'Pola terdeteksi'}. Breakout @ ${pattern.breakoutConfirmation?.closePrice?.toFixed(2) || 'N/A'}. Target ${pattern.projection?.targetPrice ? pattern.projection.targetPrice.toFixed(2) : 'N/A'}.`;
+            
+            console.log(`[scan-patterns] Preparing to send FRESH FCM for: ${title} - ${bodyText} to topic ${topic}`);
+            await sendFcmNotification(topic, title, bodyText, pattern);
+        } else {
+             console.log(`[scan-patterns] Pattern ID ${patternId} (already recorded or too old for FCM) will not trigger FCM.`);
+        }
       } else {
-        console.log(`[scan-patterns] Pattern ID ${patternId} was already notified. Skipping FCM.`);
+        console.log(`[scan-patterns] Pattern ID ${patternId} was already notified (from Firestore). Skipping FCM.`);
       }
     }
   } else if (allDetectedPatterns.length > 0 && !db) {
